@@ -18,6 +18,9 @@ Use it only with games you own. It doesn't remove or get around any protection.
    and the PS5's `sceVideoOutRegisterBuffers2`: size, pixel format, tiling), its flips and flip
    rate, and the graphics drivers' submit functions where the game has them. The log says which
    of these the game really has and calls, which tells how it shows its frames.
+   It also checks the breakpoints themselves: it logs each function's first bytes before
+   touching it, leaves alone one that doesn't read as real code, reads every int3 back, and
+   watches a few `libkernel` functions every game calls all the time, as a control.
 2. **Run the interpolator inside a game.** Run FSR3's optical flow and frame interpolation (from [ps5-framegen](https://github.com/Swordpdf/ps5-framegen)) on two
    of the game's display buffers, inside the game's process, next to Sony's graphics library.
    This is the step that decides whether the project can work.

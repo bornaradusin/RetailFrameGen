@@ -43,6 +43,11 @@ int tracer_read(Tracer *t, intptr_t addr, void *out, size_t size)
     return io(t, PIOD_READ_D, addr, out, size);
 }
 
+int tracer_read_code(Tracer *t, intptr_t addr, void *out, size_t size)
+{
+    return io(t, PIOD_READ_I, addr, out, size);
+}
+
 static int poke_byte(Tracer *t, intptr_t addr, uint8_t value)
 {
     return io(t, PIOD_WRITE_I, addr, &value, 1);
@@ -94,13 +99,18 @@ int tracer_attach(Tracer *t, pid_t pid)
 
 int tracer_add(Tracer *t, intptr_t addr, const char *name)
 {
-    if (t->count >= TRACER_MAX_BREAKPOINTS || !addr) return -1;
+    if (t->count >= TRACER_MAX_BREAKPOINTS || !addr) return TRACER_ADD_FULL;
     for (int i = 0; i < t->count; i++)
-        if (t->bp[i].addr == addr) return -1;   /* two names for one function */
+        if (t->bp[i].addr == addr) return TRACER_ADD_FULL;   /* two names for one function */
     Breakpoint *bp = &t->bp[t->count];
+    uint8_t back = 0;
     memset(bp, 0, sizeof(*bp));
-    if (io(t, PIOD_READ_I, addr, &bp->saved, 1) < 0) return -1;
-    if (poke_byte(t, addr, 0xcc) < 0) return -1;
+    if (io(t, PIOD_READ_I, addr, &bp->saved, 1) < 0) return TRACER_ADD_READ;
+    if (poke_byte(t, addr, 0xcc) < 0) return TRACER_ADD_WRITE;
+    if (io(t, PIOD_READ_I, addr, &back, 1) < 0 || back != 0xcc) {
+        poke_byte(t, addr, bp->saved);
+        return TRACER_ADD_NOT_THERE;
+    }
     bp->addr = addr;
     bp->name = name;
     bp->armed = 1;
@@ -264,7 +274,12 @@ int tracer_detach(Tracer *t)
     int clean = 0;
 
     t->pending_signal = 0;
-    for (int i = 0; i < t->count; i++) disarm(t, &t->bp[i]);
+    for (int i = 0; i < t->count; i++) {
+        uint8_t back = 0;
+        disarm(t, &t->bp[i]);
+        if (io(t, PIOD_READ_I, t->bp[i].addr, &back, 1) < 0 || back != t->bp[i].saved)
+            t->restore_mismatches++;
+    }
 
     /* Threads that hit an int3 just before it came out report it as the game runs on: each is
      * put back to the function's start. Done after a quiet moment, stopped by our SIGSTOP. */

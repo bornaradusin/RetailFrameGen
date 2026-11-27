@@ -71,13 +71,18 @@ static const Watched watched[] = {
     { "libSceGnmDriver.sprx", "sceGnmSubmitAndFlipCommandBuffers", 1 },
     { "libSceGnmDriver.sprx", "sceGnmSubmitAndFlipCommandBuffersForWorkload", 1 },
     { "libSceGnmDriver.sprx", "sceGnmSubmitCommandBuffers", 1 },
+    /* Controls: every game calls these all the time. If they catch nothing either, breakpoints
+     * don't work in the game this way. */
+    { "libkernel.sprx", "sceKernelUsleep", 1 },
+    { "libkernel.sprx", "sceKernelGetProcessTime", 1 },
+    { "libkernel.sprx", "scePthreadMutexLock", 1 },
 };
 #define WATCHED (int)(sizeof(watched) / sizeof(watched[0]))
 
 /* Libraries logged as loaded or not, to see which graphics library the game uses. */
 static const char *const libraries[] = {
     "libSceVideoOut.sprx", "libSceAgc.sprx", "libSceAgcDriver.sprx", "libSceGnmDriver.sprx",
-    "libSceGnmDriverForNeoMode.sprx",
+    "libSceGnmDriverForNeoMode.sprx", "libkernel.sprx",
 };
 
 typedef struct {
@@ -221,7 +226,7 @@ int main(void)
     memset(&s, 0, sizeof(s));
     mkdir(DIR, 0777);
     s.log = fopen(LOG_PATH, "w");
-    say(&s, "RetailFrameGen step 1 (0.2): logging the frame hand-off\n");
+    say(&s, "RetailFrameGen step 1 (0.2.1): logging the frame hand-off\n");
 
     /* ptrace and reading another process need the debugger's rights. */
     kernel_set_ucred_authid(getpid(), 0x4800000000010003l);
@@ -273,10 +278,37 @@ int main(void)
     for (int i = 0; i < WATCHED; i++) {
         if (!addrs[i]) continue;
         int index = t->count;
-        if (tracer_add(t, addrs[i], watched[i].name) < 0) {
-            say(&s, "Couldn't put a breakpoint on %s\n", watched[i].name);
+        /* What the code looks like first, as read for breakpoints (I) and as data (D): real code
+         * has a recognisable start. A function that reads as one byte over and over isn't real
+         * code as read, so it isn't touched: writing its "saved" byte back would break it. */
+        uint8_t code[16], data[16];
+        int code_ok = tracer_read_code(t, addrs[i], code, sizeof(code)) == 0;
+        int data_ok = tracer_read(t, addrs[i], data, sizeof(data)) == 0;
+        say(&s, "%s code:", watched[i].name);
+        if (code_ok) for (size_t b = 0; b < sizeof(code); b++) say(&s, " %02x", code[b]);
+        else say(&s, " (unreadable)");
+        if (!data_ok) say(&s, "; as data unreadable");
+        else if (!code_ok || memcmp(code, data, sizeof(code))) {
+            say(&s, "; as data:");
+            for (size_t b = 0; b < sizeof(data); b++) say(&s, " %02x", data[b]);
+        }
+        say(&s, "\n");
+        int same = code_ok;
+        for (size_t b = 1; same && b < sizeof(code); b++) same = code[b] == code[0];
+        if (!code_ok || same) {
+            say(&s, "  %s: its code doesn't read as code, left alone\n", watched[i].name);
             continue;
         }
+        int added = tracer_add(t, addrs[i], watched[i].name);
+        if (added < 0) {
+            say(&s, "  %s: no breakpoint: %s\n", watched[i].name,
+                added == TRACER_ADD_READ ? "its first byte couldn't be read"
+                : added == TRACER_ADD_WRITE ? "the int3 couldn't be written"
+                : added == TRACER_ADD_NOT_THERE ? "the int3 was written but didn't read back"
+                                                : "no room");
+            continue;
+        }
+        say(&s, "  %s: breakpoint in, reads back as int3\n", watched[i].name);
         s.watch[index].what = &watched[i];
         armed++;
     }
@@ -305,6 +337,8 @@ int main(void)
     say(&s, "\n  signals passed to the game: %u", t->signals_passed);
     if (t->signals_passed) say(&s, ", the last %d", t->last_signal);
     say(&s, "\n  calls caught just as the breakpoints came out, put back: %u\n", t->rewound_at_end);
+    say(&s, "  breakpoints whose first byte didn't read back as before once out: %u\n",
+        t->restore_mismatches);
     say(&s, "  %s\n", rc < 0 ? "the game went away while watched"
                      : detached == 0 ? "detached cleanly: the game runs on as before"
                                      : "detaching didn't go cleanly");

@@ -28,6 +28,7 @@ typedef struct {
     unsigned signals_passed;    /* other signals, passed to the game as they came */
     int last_signal;
     unsigned rewound_at_end;    /* hits still waiting when the breakpoints came out */
+    unsigned restore_mismatches; /* breakpoints whose byte didn't read back as it was, after */
     int pending_signal;         /* the game's, from the stop tracing ended at: passed when detaching */
 
     lwpid_t suspended[TRACER_MAX_THREADS];
@@ -45,8 +46,12 @@ typedef int (*TracerHit)(Tracer *t, Breakpoint *bp, const struct reg *regs, lwpi
 typedef void (*TracerTick)(Tracer *t, void *context);
 
 int  tracer_attach(Tracer *t, pid_t pid);
+/* Puts an int3 at addr and reads it back: 0, or TRACER_ADD_* why not (nothing is left changed). */
+enum { TRACER_ADD_FULL = -1, TRACER_ADD_READ = -2, TRACER_ADD_WRITE = -3, TRACER_ADD_NOT_THERE = -4 };
 int  tracer_add(Tracer *t, intptr_t addr, const char *name);
 int  tracer_read(Tracer *t, intptr_t addr, void *out, size_t size);
+/* Reads code: through I space, as breakpoints are put in. */
+int  tracer_read_code(Tracer *t, intptr_t addr, void *out, size_t size);
 /* Runs the process until stop_after_us microseconds have passed or hit asks to stop. Ends with
  * the process stopped and still attached: 0, or -1 when it went away. */
 int  tracer_run(Tracer *t, TracerHit hit, TracerTick tick, uint64_t tick_us, void *context,
