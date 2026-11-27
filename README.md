@@ -7,10 +7,10 @@ the console's display output (`libSceVideoOut`), and is meant to show a generate
 each two of the game's: a 30 fps game shown at 60.
 
 > **Status: step 1, reading only.** Attaching to a retail game with ptrace broke it (it went
-> black after its intros), and ptrace couldn't read the game's memory anyway. So from 0.3.0 the
-> payload doesn't attach to, stop or change the game: it only checks that the PS5's own debug
-> memory read (`mdbg`) really reads the game's code. If it does, the next version puts a small
-> logger inside the game instead of breakpoints.
+> black after its intros), so the payload doesn't attach to, stop or change the game. 0.3.0
+> showed the PS5's own debug memory read (`mdbg`) reads the game's real code. 0.4.0 finds the
+> game's import slots for the frame functions (where the game reads their addresses from), so
+> the next version can point one at a small logger inside the game.
 
 Use it only with games you own. It doesn't remove or get around any protection.
 
@@ -58,8 +58,10 @@ This makes `retailframegen.elf`.
    `nc -q0 <console's IP> 9021 < retailframegen.elf`.
 2. Within two minutes, start the game. The payload waits for it (`eboot.bin`), or uses the
    process ID in `/data/retailframegen/pid.txt` if that file exists.
-3. It reads the first bytes of the functions a game shows its frames with, logs them and ends at
-   once. The game isn't stopped or changed, and plays as it does without the payload.
+3. It reads the first bytes of the functions a game shows its frames with, lists the game's
+   memory regions and searches its writable ones for those functions' addresses, then ends.
+   This takes a few seconds. The game isn't stopped or changed, and plays as it does without
+   the payload.
 4. The log is `/data/retailframegen/log.txt`. Attach it to an issue together with the game's name.
 
 ## Licence

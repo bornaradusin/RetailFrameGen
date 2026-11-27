@@ -1,11 +1,13 @@
-/* RetailFrameGen, step 1 (0.3): can the game's memory be read, without touching the game?
+/* RetailFrameGen, step 1 (0.4): where does the game keep these functions' addresses?
  *
- * Attaching to a retail game with ptrace broke it (it went black), and ptrace's memory reads
- * didn't read the game's memory at all: every address read as the same bytes. So this version
- * doesn't attach, stop or change the game. It finds the functions a game can show its frames
- * with, as before, and reads each one's first bytes with the PS5's own debug memory read
- * (mdbg_copyout), to log whether that really reads the game's code. Only reads: nothing is
- * written to the game, and the SDK's fallback through physical memory is never used.
+ * Attaching to a retail game with ptrace broke it, so nothing here attaches to, stops or
+ * changes the game. 0.3.0 showed the PS5's own debug memory read (mdbg_copyout) reads the
+ * game's real code. This version also finds the game's import entries: when the game calls a
+ * library function, it reads the function's address from a slot in its own writable memory.
+ * It lists the game's memory regions (kern.proc.vmmap), searches its writable ones for the
+ * functions' addresses, and logs each slot found and the region it's in. The next step points
+ * such a slot at a small logger. Only reads: nothing is written to the game, and the SDK's
+ * fallback through physical memory is never used.
  *
  * SPDX-License-Identifier: GPL-3.0-or-later */
 #include <stdarg.h>
@@ -17,6 +19,7 @@
 #include <sys/stat.h>
 #include <sys/sysctl.h>
 #include <sys/user.h>
+#include <errno.h>
 
 #include <ps5/kernel.h>
 #include <ps5/mdbg.h>
@@ -25,6 +28,12 @@
 #define LOG_PATH  DIR "/log.txt"
 #define PID_PATH  DIR "/pid.txt"
 #define CODE_BYTES 16
+#define CHUNK      (1u << 20)                 /* read at a time */
+#define NEAR_GAME  0x40000000ull              /* regions this close above the game's base first */
+#define FAR_LIMIT  (16ull << 20)              /* other regions searched only when this small */
+#define TOTAL_LIMIT (768ull << 20)            /* searched at most */
+#define MAX_REGIONS 4096
+#define MAX_SLOTS  8                          /* slots logged per function */
 
 typedef struct {
     const char *library;
@@ -100,11 +109,99 @@ static int looks_like_code(const uint8_t *b)
            (b[0] & 0xf0) == 0x40 || b[0] == 0xe9 || b[0] == 0xeb || b[0] == 0xff;
 }
 
+typedef struct {
+    uint64_t start, end;
+    int prot, type;
+    char path[64];
+} Region;
+
+static Region regions[MAX_REGIONS];
+static int region_count;
+
+/* The game's memory regions, from the kernel, without attaching. -1 when it says no. */
+static int read_regions(pid_t pid)
+{
+    int mib[4] = { CTL_KERN, KERN_PROC, KERN_PROC_VMMAP, pid };
+    size_t size = 0;
+    if (sysctl(mib, 4, NULL, &size, NULL, 0) < 0) return -1;
+    size = size * 4 / 3 + 4096;
+    char *buf = malloc(size);
+    if (!buf) return -1;
+    if (sysctl(mib, 4, buf, &size, NULL, 0) < 0) { free(buf); return -1; }
+    region_count = 0;
+    for (size_t at = 0; at + sizeof(int) <= size && region_count < MAX_REGIONS;) {
+        const struct kinfo_vmentry *e = (const struct kinfo_vmentry *)(buf + at);
+        if (e->kve_structsize <= 0) break;
+        Region *r = &regions[region_count++];
+        r->start = e->kve_start;
+        r->end = e->kve_end;
+        r->prot = e->kve_protection;
+        r->type = e->kve_type;
+        snprintf(r->path, sizeof(r->path), "%s", e->kve_path);
+        at += (size_t)e->kve_structsize;
+    }
+    free(buf);
+    return 0;
+}
+
+typedef struct {
+    const char *name;
+    uint64_t base;
+} Module;
+
+static Module modules[8];
+static int module_count;
+
+/* The module whose image starts nearest below address. */
+static const char *module_of(uint64_t address)
+{
+    const Module *best = NULL;
+    for (int i = 0; i < module_count; i++)
+        if (modules[i].base && modules[i].base <= address && (!best || modules[i].base > best->base))
+            best = &modules[i];
+    return best ? best->name : "?";
+}
+
+typedef struct {
+    intptr_t addr;
+    int slots;
+} Target;
+
+static Target targets[WATCHED];
+static uint64_t searched;
+static uint8_t chunk[CHUNK];
+
+/* Searches [start, end) for 8-byte values equal to a function's address. */
+static void search(pid_t pid, const Region *region, uint64_t start, uint64_t end)
+{
+    for (uint64_t at = start; at < end && searched < TOTAL_LIMIT; at += CHUNK) {
+        size_t len = end - at < CHUNK ? (size_t)(end - at) : CHUNK;
+        if (mdbg_copyout(pid, (intptr_t)at, chunk, len) != 0) continue;
+        searched += len;
+        for (size_t off = 0; off + 8 <= len; off += 8) {
+            uint64_t value;
+            memcpy(&value, chunk + off, 8);
+            if (value < 0x10000) continue;
+            for (int i = 0; i < WATCHED; i++) {
+                if (!targets[i].addr || value != (uint64_t)targets[i].addr) continue;
+                if (++targets[i].slots <= MAX_SLOTS)
+                    say("  slot for %s at 0x%llx (region 0x%llx-0x%llx %s%s%s \"%s\", near %s)\n",
+                        watched[i].name, (unsigned long long)(at + off),
+                        (unsigned long long)region->start, (unsigned long long)region->end,
+                        region->prot & KVME_PROT_READ ? "r" : "-",
+                        region->prot & KVME_PROT_WRITE ? "w" : "-",
+                        region->prot & KVME_PROT_EXEC ? "x" : "-", region->path,
+                        module_of(at + off));
+            }
+        }
+    }
+}
+
 int main(void)
 {
     mkdir(DIR, 0777);
     log_file = fopen(LOG_PATH, "w");
-    say("RetailFrameGen step 1 (0.3.0): reading the game's code, without attaching to it\n");
+    say("RetailFrameGen step 1 (0.4.0): finding the game's import slots, without attaching to it\n");
 
     say("Waiting up to 2 minutes for a game to start...\n");
     pid_t pid = -1;
@@ -142,6 +239,7 @@ int main(void)
             continue;
         }
         found++;
+        targets[i].addr = addr;
         say("%s at 0x%llx:", watched[i].name, (unsigned long long)addr);
         if (mdbg_copyout(pid, addr, code[i], CODE_BYTES) != 0) {
             say(" unreadable\n");
@@ -165,10 +263,72 @@ int main(void)
     else if (distinct < read)
         say("Some functions read as the same bytes: this may not be reading the game's code.\n");
     else if (like_code * 2 >= read)
-        say("Reading works: each function reads differently, as code. The next step can put a "
-            "logger inside the game.\n");
+        say("Reading works: each function reads differently, as code.\n");
     else
         say("Each function reads differently, but not clearly as code: send this log.\n");
+
+    /* The modules, to say which one a slot belongs to. */
+    static const char *const module_names[] = {
+        "eboot.bin", "libkernel.sprx", "libSceVideoOut.sprx", "libSceAgcDriver.sprx", "libSceAgc.sprx",
+    };
+    uint64_t game_base = 0;
+    for (size_t i = 0; i < sizeof(module_names) / sizeof(module_names[0]); i++) {
+        uint32_t h = 0;
+        if (kernel_dynlib_handle(pid, module_names[i], &h) < 0) continue;
+        uint64_t base = (uint64_t)kernel_dynlib_mapbase_addr(pid, h);
+        modules[module_count].name = module_names[i];
+        modules[module_count++].base = base;
+        say("module %s at 0x%llx\n", module_names[i], (unsigned long long)base);
+        if (i == 0) game_base = base;
+    }
+    if (!game_base) say("The game's own image (eboot.bin) wasn't found: only small regions are searched\n");
+
+    say("\nThe game's memory regions:\n");
+    if (read_regions(pid) < 0) {
+        say("  the kernel didn't list them (errno %d)", errno);
+        if (game_base) {
+            say(": searching the 256 MB from the game's base instead\n");
+            Region whole = { game_base, game_base + (256ull << 20), KVME_PROT_READ, 0, "(game base)" };
+            search(pid, &whole, whole.start, whole.end);
+        } else {
+            say("\n");
+        }
+    } else {
+        int writable = 0;
+        for (int i = 0; i < region_count; i++) {
+            const Region *r = &regions[i];
+            if (r->prot & KVME_PROT_WRITE) writable++;
+            say("  0x%llx-0x%llx %s%s%s type=%d %lluK \"%s\"\n", (unsigned long long)r->start,
+                (unsigned long long)r->end, r->prot & KVME_PROT_READ ? "r" : "-",
+                r->prot & KVME_PROT_WRITE ? "w" : "-", r->prot & KVME_PROT_EXEC ? "x" : "-",
+                r->type, (unsigned long long)((r->end - r->start) >> 10), r->path);
+        }
+        say("%d regions, %d writable\n\nSearching the writable ones near the game's base, then small ones:\n",
+            region_count, writable);
+        /* Near the game's own image first: its import slots are there. Then other small writable
+         * regions. Big ones (heaps, graphics memory) and device memory are left alone. */
+        for (int pass = 0; pass < 2; pass++)
+            for (int i = 0; i < region_count && searched < TOTAL_LIMIT; i++) {
+                const Region *r = &regions[i];
+                int near = game_base && r->start >= game_base && r->start < game_base + NEAR_GAME;
+                if (!(r->prot & KVME_PROT_WRITE) || r->type == KVME_TYPE_DEVICE ||
+                    r->type == KVME_TYPE_PHYS || r->type == KVME_TYPE_MGTDEVICE)
+                    continue;
+                if (pass == 0 ? !near : (near || r->end - r->start > FAR_LIMIT)) continue;
+                search(pid, r, r->start, r->end);
+            }
+    }
+    say("\nsearched %llu MB\n", (unsigned long long)(searched >> 20));
+    int with_slots = 0;
+    for (int i = 0; i < WATCHED; i++) {
+        if (!targets[i].addr) continue;
+        say("  %s: %d slot%s\n", watched[i].name, targets[i].slots, targets[i].slots == 1 ? "" : "s");
+        if (targets[i].slots) with_slots++;
+    }
+    if (with_slots)
+        say("Import slots found for %d functions: the next step can point one at a logger.\n", with_slots);
+    else
+        say("No slot holds any of these addresses in what was searched: send this log.\n");
     say("Nothing in the game was stopped or changed.\n");
     if (log_file) fclose(log_file);
     return 0;
