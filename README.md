@@ -4,9 +4,7 @@ Frame generation for retail PS5 games you own, on a jailbroken PS5.
 
 RetailFrameGen is a payload that attaches to a running retail game, watches the frames it hands to
 the console's display output (`libSceVideoOut`), and is meant to show a generated frame between
-each two of the game's: a 30 fps game shown at 60. It is separate from
-[PC5](https://github.com/bornaradusin/PC5), whose frame generation only works for Windows games
-running through its own Vulkan driver.
+each two of the game's: a 30 fps game shown at 60.
 
 > **Status: step 1, logging only.** The payload doesn't generate any frames yet. It logs how a
 > game shows its frames, so the next steps can be built on what games really do.
@@ -20,12 +18,11 @@ Use it only with games you own. It doesn't remove or get around any protection.
    `sceVideoOutSubmitFlip` / `sceVideoOutSetFlipRate` (when and how often frames are shown).
    A game that registers buffers but never calls `sceVideoOutSubmitFlip` flips from the GPU's
    command buffer instead, and the log shows that too.
-2. **Run the interpolator inside a game.** Run FSR3's optical flow and frame interpolation (the
-   interpolator PC5 uses, from [ps5-framegen](https://github.com/Swordpdf/ps5-framegen)) on two
+2. **Run the interpolator inside a game.** Run FSR3's optical flow and frame interpolation (from [ps5-framegen](https://github.com/Swordpdf/ps5-framegen)) on two
    of the game's display buffers, inside the game's process, next to Sony's graphics library.
    This is the step that decides whether the project can work.
 3. **Pace the output.** Show the game's frames at twice the flip rate, with a generated frame
-   before each one, the way PC5's `pw_framegen` does with a Vulkan swapchain.
+   before each one.
 4. **Per-game settings.** Turn it on per game, with fixes where a game needs them.
 
 ## Limits to expect
