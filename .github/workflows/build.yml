@@ -3,6 +3,14 @@ name: Build
 on:
   push:
   workflow_dispatch:
+    inputs:
+      version:
+        description: "Version for a draft release (e.g. 0.1.0); empty for a build only"
+        required: false
+        default: ""
+
+permissions:
+  contents: write
 
 jobs:
   build:
@@ -26,3 +34,15 @@ jobs:
         with:
           name: retailframegen
           path: retailframegen.elf
+
+      - name: Draft release
+        if: github.event_name == 'workflow_dispatch' && inputs.version != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ inputs.version }}
+        run: |
+          gh release create "v$VERSION" retailframegen.elf --draft --target "$GITHUB_SHA" \
+            --title "RetailFrameGen $VERSION" \
+            --notes "RetailFrameGen $VERSION, step 1: logs how a retail game shows its frames (display buffers, flips, flip rate) to /data/retailframegen/log.txt. No frames are generated yet.
+
+          Send retailframegen.elf to the ELF loader (port 9021), then start the game within two minutes. See the README for details."
