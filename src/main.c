@@ -176,7 +176,11 @@ static void search(pid_t pid, const Region *region, uint64_t start, uint64_t end
 {
     for (uint64_t at = start; at < end && searched < TOTAL_LIMIT; at += CHUNK) {
         size_t len = end - at < CHUNK ? (size_t)(end - at) : CHUNK;
-        if (mdbg_copyout(pid, (intptr_t)at, chunk, len) != 0) continue;
+        if (mdbg_copyout(pid, (intptr_t)at, chunk, len) != 0) {
+            say("  couldn't read 0x%llx-0x%llx\n", (unsigned long long)at,
+                (unsigned long long)(at + len));
+            continue;
+        }
         searched += len;
         for (size_t off = 0; off + 8 <= len; off += 8) {
             uint64_t value;
@@ -201,7 +205,7 @@ int main(void)
 {
     mkdir(DIR, 0777);
     log_file = fopen(LOG_PATH, "w");
-    say("RetailFrameGen step 1 (0.4.0): finding the game's import slots, without attaching to it\n");
+    say("RetailFrameGen step 1 (0.4.1): finding the game's import slots, without attaching to it\n");
 
     say("Waiting up to 2 minutes for a game to start...\n");
     pid_t pid = -1;
@@ -303,15 +307,18 @@ int main(void)
                 r->prot & KVME_PROT_WRITE ? "w" : "-", r->prot & KVME_PROT_EXEC ? "x" : "-",
                 r->type, (unsigned long long)((r->end - r->start) >> 10), r->path);
         }
-        say("%d regions, %d writable\n\nSearching the writable ones near the game's base, then small ones:\n",
-            region_count, writable);
-        /* Near the game's own image first: its import slots are there. Then other small writable
-         * regions. Big ones (heaps, graphics memory) and device memory are left alone. */
+        say("%d regions, %d writable\n\nSearching the writable ones and the read-only import tables "
+            "near the game's base, then small ones:\n", region_count, writable);
+        /* Near the game's own image first: its import slots are there. Then other small ones.
+         * Each image has a small read-only anonymous region (type 1) between its constants and its
+         * data: its import table, filled in at start and then made read-only, so those are
+         * searched too. Big regions (heaps, graphics memory) and device memory are left alone. */
         for (int pass = 0; pass < 2; pass++)
             for (int i = 0; i < region_count && searched < TOTAL_LIMIT; i++) {
                 const Region *r = &regions[i];
                 int near = game_base && r->start >= game_base && r->start < game_base + NEAR_GAME;
-                if (!(r->prot & KVME_PROT_WRITE) || r->type == KVME_TYPE_DEVICE ||
+                int import_table = r->prot == KVME_PROT_READ && r->type == KVME_TYPE_DEFAULT;
+                if (!((r->prot & KVME_PROT_WRITE) || import_table) || r->type == KVME_TYPE_DEVICE ||
                     r->type == KVME_TYPE_PHYS || r->type == KVME_TYPE_MGTDEVICE)
                     continue;
                 if (pass == 0 ? !near : (near || r->end - r->start > FAR_LIMIT)) continue;

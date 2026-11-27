@@ -59,7 +59,8 @@ This makes `retailframegen.elf`.
 2. Within two minutes, start the game. The payload waits for it (`eboot.bin`), or uses the
    process ID in `/data/retailframegen/pid.txt` if that file exists.
 3. It reads the first bytes of the functions a game shows its frames with, lists the game's
-   memory regions and searches its writable ones for those functions' addresses, then ends.
+   memory regions and searches its writable ones and its read-only import tables for those
+   functions' addresses, then ends.
    This takes a few seconds. The game isn't stopped or changed, and plays as it does without
    the payload.
 4. The log is `/data/retailframegen/log.txt`. Attach it to an issue together with the game's name.
