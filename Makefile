@@ -12,11 +12,11 @@ ELF := retailframegen.elf
 CFLAGS := -Wall -Werror -O2
 LDADD  := -lkernel_sys
 
-SRCS := src/main.c src/tracer.c
+SRCS := src/main.c
 
 all: $(ELF)
 
-$(ELF): $(SRCS) src/tracer.h
+$(ELF): $(SRCS)
 	$(CC) $(CFLAGS) -o $@ $(SRCS) $(LDADD)
 
 clean:

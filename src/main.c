@@ -1,115 +1,64 @@
-/* RetailFrameGen, step 1: log how a running retail game shows its frames.
+/* RetailFrameGen, step 1 (0.3): can the game's memory be read, without touching the game?
  *
- * Attaches to the game and puts breakpoints on the functions a game can show its frames with:
- * libSceVideoOut's buffer registration and flips (the PS4 ones and the PS5 "2" ones), and, when
- * the game has them, the graphics drivers' submit-and-flip functions. Each call is logged for 30
- * seconds to /data/retailframegen/log.txt, with how far it got as it goes, so a log cut short
- * still shows where. Nothing in the game is changed, and every breakpoint is taken out after.
- *
- * Function names that a game's libraries don't have are logged as "not in the game": several
- * here are best guesses at what PS5 games use, and the log says which ones are real.
+ * Attaching to a retail game with ptrace broke it (it went black), and ptrace's memory reads
+ * didn't read the game's memory at all: every address read as the same bytes. So this version
+ * doesn't attach, stop or change the game. It finds the functions a game can show its frames
+ * with, as before, and reads each one's first bytes with the PS5's own debug memory read
+ * (mdbg_copyout), to log whether that really reads the game's code. Only reads: nothing is
+ * written to the game, and the SDK's fallback through physical memory is never used.
  *
  * SPDX-License-Identifier: GPL-3.0-or-later */
-#include "tracer.h"
-
-#include <signal.h>
 #include <stdarg.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <time.h>
 #include <unistd.h>
 #include <sys/stat.h>
 #include <sys/sysctl.h>
 #include <sys/user.h>
 
 #include <ps5/kernel.h>
+#include <ps5/mdbg.h>
 
 #define DIR       "/data/retailframegen"
 #define LOG_PATH  DIR "/log.txt"
 #define PID_PATH  DIR "/pid.txt"
-#define RUN_US    (30u * 1000000u)
-#define TICK_US   (5u * 1000000u)
-#define DETAILED_CALLS 8      /* calls of a function logged with their arguments */
-#define DUMPED_CALLS   3      /* of those, with the memory their arguments point at */
-#define TIMED_CALLS    60     /* calls of a function logged with the time since the one before */
-#define FREQUENT_CAP   300    /* a frequent function's breakpoint comes out after this many */
-
-/* The display buffer attribute as libSceVideoOut takes it (PS4 layout; the PS5 may add fields,
- * so the raw bytes are logged too). */
-typedef struct {
-    int32_t  pixel_format;
-    int32_t  tiling_mode;
-    int32_t  aspect_ratio;
-    uint32_t width;
-    uint32_t height;
-    uint32_t pitch_in_pixel;
-    uint32_t option;
-    uint32_t reserved0;
-    uint64_t reserved1;
-} BufferAttribute;
+#define CODE_BYTES 16
 
 typedef struct {
     const char *library;
     const char *name;
-    int frequent;   /* called every frame: its breakpoint comes out after FREQUENT_CAP calls */
 } Watched;
 
-/* What a game may show its frames with. The PS4 libSceVideoOut names are known; the rest are
- * the likely PS5 ones, checked against what the game's libraries really have. */
 static const Watched watched[] = {
-    { "libSceVideoOut.sprx", "sceVideoOutOpen", 0 },
-    { "libSceVideoOut.sprx", "sceVideoOutRegisterBuffers", 0 },
-    { "libSceVideoOut.sprx", "sceVideoOutRegisterBuffers2", 0 },
-    { "libSceVideoOut.sprx", "sceVideoOutSetFlipRate", 0 },
-    { "libSceVideoOut.sprx", "sceVideoOutSubmitChangeBufferAttribute", 0 },
-    { "libSceVideoOut.sprx", "sceVideoOutSubmitChangeBufferAttribute2", 0 },
-    { "libSceVideoOut.sprx", "sceVideoOutSubmitFlip", 1 },
-    { "libSceAgcDriver.sprx", "sceAgcDriverSubmitDcb", 1 },
-    { "libSceAgcDriver.sprx", "sceAgcDriverSubmitMultiDcbs", 1 },
-    { "libSceGnmDriver.sprx", "sceGnmSubmitAndFlipCommandBuffers", 1 },
-    { "libSceGnmDriver.sprx", "sceGnmSubmitAndFlipCommandBuffersForWorkload", 1 },
-    { "libSceGnmDriver.sprx", "sceGnmSubmitCommandBuffers", 1 },
-    /* Controls: every game calls these all the time. If they catch nothing either, breakpoints
-     * don't work in the game this way. */
-    { "libkernel.sprx", "sceKernelUsleep", 1 },
-    { "libkernel.sprx", "sceKernelGetProcessTime", 1 },
-    { "libkernel.sprx", "scePthreadMutexLock", 1 },
+    { "libSceVideoOut.sprx", "sceVideoOutOpen" },
+    { "libSceVideoOut.sprx", "sceVideoOutRegisterBuffers" },
+    { "libSceVideoOut.sprx", "sceVideoOutRegisterBuffers2" },
+    { "libSceVideoOut.sprx", "sceVideoOutSetFlipRate" },
+    { "libSceVideoOut.sprx", "sceVideoOutSubmitChangeBufferAttribute" },
+    { "libSceVideoOut.sprx", "sceVideoOutSubmitChangeBufferAttribute2" },
+    { "libSceVideoOut.sprx", "sceVideoOutSubmitFlip" },
+    { "libSceAgcDriver.sprx", "sceAgcDriverSubmitDcb" },
+    { "libSceAgcDriver.sprx", "sceAgcDriverSubmitMultiDcbs" },
+    { "libkernel.sprx", "sceKernelUsleep" },
+    { "libkernel.sprx", "sceKernelGetProcessTime" },
+    { "libkernel.sprx", "scePthreadMutexLock" },
 };
 #define WATCHED (int)(sizeof(watched) / sizeof(watched[0]))
 
-/* Libraries logged as loaded or not, to see which graphics library the game uses. */
 static const char *const libraries[] = {
     "libSceVideoOut.sprx", "libSceAgc.sprx", "libSceAgcDriver.sprx", "libSceGnmDriver.sprx",
     "libSceGnmDriverForNeoMode.sprx", "libkernel.sprx",
 };
 
-typedef struct {
-    const Watched *what;
-    uint64_t first_us, last_us;
-    int disarmed_after;   /* calls when its breakpoint came out, 0 while in */
-} Watch;
+static FILE *log_file;
 
-typedef struct {
-    FILE *log;
-    uint64_t start_us;
-    Watch watch[TRACER_MAX_BREAKPOINTS];   /* by breakpoint index */
-    unsigned hits;
-} Session;
-
-static uint64_t now_us(void)
-{
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (uint64_t)ts.tv_sec * 1000000u + (uint64_t)ts.tv_nsec / 1000u;
-}
-
-static void say(Session *s, const char *format, ...)
+static void say(const char *format, ...)
 {
     va_list args;
     va_start(args, format);
-    if (s->log) { vfprintf(s->log, format, args); fflush(s->log); }
+    if (log_file) { vfprintf(log_file, format, args); fflush(log_file); }
     va_end(args);
     va_start(args, format);
     vprintf(format, args);
@@ -144,208 +93,83 @@ static pid_t find_game(void)
     return found;
 }
 
-static void dump(Session *s, Tracer *t, const char *label, uint64_t address)
+/* x86-64 function starts seen in PS5 libraries: push rbp, endbr64, a REX prefix, jmp. */
+static int looks_like_code(const uint8_t *b)
 {
-    uint8_t bytes[48];
-    if (address < 0x10000 || tracer_read(t, (intptr_t)address, bytes, sizeof(bytes)) < 0) return;
-    say(s, "           %s ->", label);
-    for (size_t i = 0; i < sizeof(bytes); i++) say(s, " %02x", bytes[i]);
-    say(s, "\n");
-}
-
-static void register_buffers(Session *s, Tracer *t, const struct reg *r)
-{
-    /* (handle, startIndex, void *const *addresses, bufferNum, const attribute *) */
-    BufferAttribute a;
-    if (tracer_read(t, (intptr_t)r->r_r8, &a, sizeof(a)) == 0)
-        say(s, "           as PS4 buffers: start=%d count=%d %ux%u pitch=%u format=0x%x tiling=%d "
-               "aspect=%d option=0x%x\n", (int)r->r_rsi, (int)r->r_rcx, a.width, a.height,
-            a.pitch_in_pixel, (unsigned)a.pixel_format, a.tiling_mode, a.aspect_ratio, a.option);
-    for (int i = 0; i < (int)r->r_rcx && i < 16; i++) {
-        uint64_t address = 0;
-        if (tracer_read(t, (intptr_t)r->r_rdx + i * 8, &address, 8) == 0)
-            say(s, "           buffer %d at 0x%016llx\n", (int)r->r_rsi + i,
-                (unsigned long long)address);
-    }
-}
-
-static int on_hit(Tracer *t, Breakpoint *bp, const struct reg *r, lwpid_t lwp, void *context)
-{
-    Session *s = context;
-    Watch *w = &s->watch[bp - t->bp];
-    const uint64_t now = now_us();
-    const double at = (now - s->start_us) / 1e6;
-
-    s->hits++;
-    if (bp->hits == 1) {
-        w->first_us = now;
-        say(s, "%8.3f first call of %s\n", at, bp->name);
-    }
-    if (bp->hits <= DETAILED_CALLS) {
-        say(s, "%8.3f %s #%u thread=%d rdi=0x%llx rsi=0x%llx rdx=0x%llx rcx=0x%llx r8=0x%llx "
-               "r9=0x%llx\n", at, bp->name, bp->hits, (int)lwp,
-            (unsigned long long)r->r_rdi, (unsigned long long)r->r_rsi,
-            (unsigned long long)r->r_rdx, (unsigned long long)r->r_rcx,
-            (unsigned long long)r->r_r8, (unsigned long long)r->r_r9);
-        if (bp->hits <= DUMPED_CALLS) {
-            dump(s, t, "rdi", (uint64_t)r->r_rdi);
-            dump(s, t, "rsi", (uint64_t)r->r_rsi);
-            dump(s, t, "rdx", (uint64_t)r->r_rdx);
-            dump(s, t, "rcx", (uint64_t)r->r_rcx);
-            dump(s, t, "r8", (uint64_t)r->r_r8);
-            dump(s, t, "r9", (uint64_t)r->r_r9);
-        }
-        if (!strcmp(bp->name, "sceVideoOutRegisterBuffers")) register_buffers(s, t, r);
-    } else if (bp->hits <= TIMED_CALLS) {
-        say(s, "%8.3f %s #%u since_last=%.2fms\n", at, bp->name, bp->hits,
-            (now - w->last_us) / 1000.0);
-    }
-    w->last_us = now;
-
-    if (w->what->frequent && bp->hits >= FREQUENT_CAP) {
-        w->disarmed_after = (int)bp->hits;
-        say(s, "%8.3f %s: %u calls, its breakpoint comes out so the game runs at full speed\n", at,
-            bp->name, bp->hits);
-        return TRACER_DISARM;
-    }
-    return TRACER_GO;
-}
-
-static void on_tick(Tracer *t, void *context)
-{
-    Session *s = context;
-    say(s, "%8.3f still watching: %u calls caught", (now_us() - s->start_us) / 1e6, s->hits);
-    if (t->foreign_traps) say(s, ", %u other traps", t->foreign_traps);
-    if (t->signals_passed) say(s, ", %u signals passed to the game", t->signals_passed);
-    say(s, "\n");
+    return b[0] == 0x55 || (b[0] == 0xf3 && b[1] == 0x0f && b[2] == 0x1e && b[3] == 0xfa) ||
+           (b[0] & 0xf0) == 0x40 || b[0] == 0xe9 || b[0] == 0xeb || b[0] == 0xff;
 }
 
 int main(void)
 {
-    Session s;
-    memset(&s, 0, sizeof(s));
     mkdir(DIR, 0777);
-    s.log = fopen(LOG_PATH, "w");
-    say(&s, "RetailFrameGen step 1 (0.2.1): logging the frame hand-off\n");
+    log_file = fopen(LOG_PATH, "w");
+    say("RetailFrameGen step 1 (0.3.0): reading the game's code, without attaching to it\n");
 
-    /* ptrace and reading another process need the debugger's rights. */
-    kernel_set_ucred_authid(getpid(), 0x4800000000010003l);
-
-    /* Waits for the game to start, so its buffer registrations at start are seen too. */
-    say(&s, "Waiting up to 2 minutes for a game to start...\n");
+    say("Waiting up to 2 minutes for a game to start...\n");
     pid_t pid = -1;
     for (int tries = 0; tries < 1200 && (pid = find_game()) < 0; tries++) usleep(100000);
     if (pid < 0) {
-        say(&s, "No game started: start a game, or put its PID in " PID_PATH "\n");
+        say("No game started: start a game, or put its PID in " PID_PATH "\n");
         return 1;
     }
-    say(&s, "game pid=%d\n", (int)pid);
+    say("game pid=%d\n", (int)pid);
 
-    /* Right after the game starts, its libraries may not be loaded yet. */
     uint32_t handle = 0;
     int loaded = -1;
     for (int tries = 0; tries < 2000 && (loaded = kernel_dynlib_handle(pid, "libSceVideoOut.sprx",
                                                                       &handle)) < 0; tries++)
         usleep(5000);
     if (loaded < 0) {
-        say(&s, "The game has no libSceVideoOut loaded after 10 seconds\n");
+        say("The game has no libSceVideoOut loaded after 10 seconds\n");
         return 1;
     }
     for (size_t i = 0; i < sizeof(libraries) / sizeof(libraries[0]); i++) {
         uint32_t h = 0;
-        say(&s, "library %s: %s\n", libraries[i],
+        say("library %s: %s\n", libraries[i],
             kernel_dynlib_handle(pid, libraries[i], &h) < 0 ? "not loaded" : "loaded");
     }
 
-    intptr_t addrs[WATCHED];
+    uint8_t code[WATCHED][CODE_BYTES];
+    int read_ok[WATCHED] = { 0 };
+    int found = 0, read = 0, like_code = 0, distinct = 0;
     for (int i = 0; i < WATCHED; i++) {
         uint32_t h = 0;
-        addrs[i] = kernel_dynlib_handle(pid, watched[i].library, &h) < 0
-                       ? 0 : kernel_dynlib_dlsym(pid, h, watched[i].name);
-        if (addrs[i]) say(&s, "%s at 0x%llx\n", watched[i].name, (unsigned long long)addrs[i]);
-        else say(&s, "%s: not in the game\n", watched[i].name);
-    }
-
-    Tracer *t = calloc(1, sizeof(*t));
-    if (!t) { say(&s, "Out of memory\n"); return 1; }
-    say(&s, "Attaching to the game...\n");
-    if (tracer_attach(t, pid) < 0) {
-        say(&s, "Couldn't attach to the game\n");
-        return 1;
-    }
-    say(&s, "Attached\n");
-    int armed = 0;
-    for (int i = 0; i < WATCHED; i++) {
-        if (!addrs[i]) continue;
-        int index = t->count;
-        /* What the code looks like first, as read for breakpoints (I) and as data (D): real code
-         * has a recognisable start. A function that reads as one byte over and over isn't real
-         * code as read, so it isn't touched: writing its "saved" byte back would break it. */
-        uint8_t code[16], data[16];
-        int code_ok = tracer_read_code(t, addrs[i], code, sizeof(code)) == 0;
-        int data_ok = tracer_read(t, addrs[i], data, sizeof(data)) == 0;
-        say(&s, "%s code:", watched[i].name);
-        if (code_ok) for (size_t b = 0; b < sizeof(code); b++) say(&s, " %02x", code[b]);
-        else say(&s, " (unreadable)");
-        if (!data_ok) say(&s, "; as data unreadable");
-        else if (!code_ok || memcmp(code, data, sizeof(code))) {
-            say(&s, "; as data:");
-            for (size_t b = 0; b < sizeof(data); b++) say(&s, " %02x", data[b]);
-        }
-        say(&s, "\n");
-        int same = code_ok;
-        for (size_t b = 1; same && b < sizeof(code); b++) same = code[b] == code[0];
-        if (!code_ok || same) {
-            say(&s, "  %s: its code doesn't read as code, left alone\n", watched[i].name);
+        intptr_t addr = kernel_dynlib_handle(pid, watched[i].library, &h) < 0
+                            ? 0 : kernel_dynlib_dlsym(pid, h, watched[i].name);
+        if (!addr) {
+            say("%s: not in the game\n", watched[i].name);
             continue;
         }
-        int added = tracer_add(t, addrs[i], watched[i].name);
-        if (added < 0) {
-            say(&s, "  %s: no breakpoint: %s\n", watched[i].name,
-                added == TRACER_ADD_READ ? "its first byte couldn't be read"
-                : added == TRACER_ADD_WRITE ? "the int3 couldn't be written"
-                : added == TRACER_ADD_NOT_THERE ? "the int3 was written but didn't read back"
-                                                : "no room");
+        found++;
+        say("%s at 0x%llx:", watched[i].name, (unsigned long long)addr);
+        if (mdbg_copyout(pid, addr, code[i], CODE_BYTES) != 0) {
+            say(" unreadable\n");
             continue;
         }
-        say(&s, "  %s: breakpoint in, reads back as int3\n", watched[i].name);
-        s.watch[index].what = &watched[i];
-        armed++;
+        read_ok[i] = 1;
+        read++;
+        for (int b = 0; b < CODE_BYTES; b++) say(" %02x", code[i][b]);
+        if (looks_like_code(code[i])) { like_code++; say("  (looks like a function's start)"); }
+        say("\n");
+        int seen = 0;
+        for (int j = 0; j < i && !seen; j++)
+            seen = read_ok[j] && !memcmp(code[i], code[j], CODE_BYTES);
+        if (!seen) distinct++;
     }
-    say(&s, "%d breakpoints in; watching for 30 seconds\n", armed);
 
-    s.start_us = now_us();
-    int rc = tracer_run(t, on_hit, on_tick, TICK_US, &s, RUN_US);
-    const double seconds = (now_us() - s.start_us) / 1e6;
-    say(&s, "%8.3f %s; taking the breakpoints out\n", seconds,
-        rc < 0 ? "the game went away, or tracing failed" : "done watching");
-    int detached = rc < 0 ? -1 : tracer_detach(t);
-
-    say(&s, "\nafter %.1fs:\n", seconds);
-    for (int i = 0; i < t->count; i++) {
-        const Breakpoint *bp = &t->bp[i];
-        const Watch *w = &s.watch[i];
-        say(&s, "  %s: %u calls", bp->name, bp->hits);
-        if (bp->hits > 1 && w->last_us > w->first_us)
-            say(&s, " (%.1f a second while watched)",
-                (bp->hits - 1) / ((w->last_us - w->first_us) / 1e6));
-        if (w->disarmed_after) say(&s, ", watched for the first %d", w->disarmed_after);
-        say(&s, "\n");
-    }
-    say(&s, "  other traps (not passed to the game): %u", t->foreign_traps);
-    if (t->foreign_traps) say(&s, ", the last at 0x%llx", (unsigned long long)t->last_foreign_rip);
-    say(&s, "\n  signals passed to the game: %u", t->signals_passed);
-    if (t->signals_passed) say(&s, ", the last %d", t->last_signal);
-    say(&s, "\n  calls caught just as the breakpoints came out, put back: %u\n", t->rewound_at_end);
-    say(&s, "  breakpoints whose first byte didn't read back as before once out: %u\n",
-        t->restore_mismatches);
-    say(&s, "  %s\n", rc < 0 ? "the game went away while watched"
-                     : detached == 0 ? "detached cleanly: the game runs on as before"
-                                     : "detaching didn't go cleanly");
-    if (s.hits == 0 && rc == 0)
-        say(&s, "Nothing was caught: the game didn't call any of the functions above while it was "
-                "watched. That doesn't say yet how it shows its frames.\n");
-    if (s.log) fclose(s.log);
-    free(t);
+    say("\n%d functions found, %d read, %d different, %d look like a function's start\n", found,
+        read, distinct, like_code);
+    if (read == 0)
+        say("The game's code can't be read this way either.\n");
+    else if (distinct < read)
+        say("Some functions read as the same bytes: this may not be reading the game's code.\n");
+    else if (like_code * 2 >= read)
+        say("Reading works: each function reads differently, as code. The next step can put a "
+            "logger inside the game.\n");
+    else
+        say("Each function reads differently, but not clearly as code: send this log.\n");
+    say("Nothing in the game was stopped or changed.\n");
+    if (log_file) fclose(log_file);
     return 0;
 }
