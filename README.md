@@ -13,11 +13,11 @@ Use it only with games you own. It doesn't remove or get around any protection.
 
 ## The plan
 
-1. **Watch the frame hand-off (now).** Attach to the game and log its calls to
-   `sceVideoOutRegisterBuffers` (the display buffers: size, pixel format, tiling) and
-   `sceVideoOutSubmitFlip` / `sceVideoOutSetFlipRate` (when and how often frames are shown).
-   A game that registers buffers but never calls `sceVideoOutSubmitFlip` flips from the GPU's
-   command buffer instead, and the log shows that too.
+1. **Watch the frame hand-off (now).** Attach to the game and log its calls to the functions it
+   can show its frames with: `libSceVideoOut`'s buffer registration (`sceVideoOutRegisterBuffers`
+   and the PS5's `sceVideoOutRegisterBuffers2`: size, pixel format, tiling), its flips and flip
+   rate, and the graphics drivers' submit functions where the game has them. The log says which
+   of these the game really has and calls, which tells how it shows its frames.
 2. **Run the interpolator inside a game.** Run FSR3's optical flow and frame interpolation (from [ps5-framegen](https://github.com/Swordpdf/ps5-framegen)) on two
    of the game's display buffers, inside the game's process, next to Sony's graphics library.
    This is the step that decides whether the project can work.
@@ -57,9 +57,12 @@ This makes `retailframegen.elf`.
    process ID in `/data/retailframegen/pid.txt` if that file exists, and attaches as soon as the
    game's display library is loaded, so the display buffers the game registers as it starts are
    logged too.
-3. It logs for 30 seconds, then lets the game go on as before. The game slows down a little
-   while it logs.
+3. It logs for 30 seconds, then lets the game go on as before. The game slows down while it
+   logs; a function called every frame is watched for its first 300 calls, then left alone.
 4. The log is `/data/retailframegen/log.txt`. Attach it to an issue together with the game's name.
+   It's written as it goes (a line every 5 seconds too), so a log cut short shows where it got to.
+
+If the game freezes or goes black, restart the console: the payload changes nothing that stays.
 
 ## Licence
 
